@@ -946,6 +946,16 @@ def _flatten_tui_event(event: dict[str, Any]) -> dict[str, Any]:
     return flattened
 
 
+def _is_tui_goal_terminal_event(event: dict[str, Any]) -> bool:
+    event = _flatten_tui_event(event)
+    if str(event.get("type") or "") != "status.update" or str(event.get("kind") or "") != "goal":
+        return False
+    status = str(event.get("status") or event.get("state") or "").strip().lower()
+    if status in {"achieved", "complete", "completed", "done", "success", "succeeded"}:
+        return True
+    text = str(event.get("text") or event.get("message") or "").strip().lower()
+    return "goal achieved" in text or "✓" in text or "✔" in text
+
 def _format_tui_event_for_openwebui(event: dict[str, Any], *, message_delta_seen: bool) -> tuple[str, str]:
     event = _flatten_tui_event(event)
     event_type = str(event.get("type") or "")
@@ -1824,6 +1834,13 @@ async def _write_goal_responses_stream_tui(request: web.Request, session_id: str
     try:
         tui_session_id, tui_session_key = await _get_tui_session_key(session_id)
         mgr = GoalManager(session_id=tui_session_key)
+
+        def goal_is_active() -> bool:
+            try:
+                return GoalManager(session_id=tui_session_key).is_active()
+            except Exception:
+                return mgr.is_active()
+
         lower = arg.strip().lower()
 
         if not await send_event(
@@ -1912,7 +1929,7 @@ async def _write_goal_responses_stream_tui(request: web.Request, session_id: str
                 if not await _safe_raw_write(resp, b": hermes-tui-keepalive\n\n"):
                     await _stop_tui_goal_from_stream_disconnect(session_id, tui_session_id, tui_session_key, record)
                     return resp
-                if not mgr.is_active():
+                if not goal_is_active():
                     inactive_since = inactive_since or time.time()
                     if time.time() - inactive_since > 1.0:
                         break
@@ -1951,22 +1968,25 @@ async def _write_goal_responses_stream_tui(request: web.Request, session_id: str
                     record.status = complete_status if complete_status in TERMINAL_RUN_STATUSES else "paused"
                     inactive_since = time.time()
                     continue
-                if not mgr.is_active():
+                if not goal_is_active():
                     inactive_since = time.time()
             elif event_type == "message.start":
                 message_delta_seen = False
                 if final_text_parts and not await send_message_delta("\n\n---\n"):
                     await _stop_tui_goal_from_stream_disconnect(session_id, tui_session_id, tui_session_key, record)
                     return resp
-            elif event_type == "status.update" and str(event.get("kind") or "") == "goal" and not mgr.is_active():
-                inactive_since = time.time()
+            elif event_type == "status.update" and str(event.get("kind") or "") == "goal":
+                if _is_tui_goal_terminal_event(event) or not goal_is_active():
+                    if _is_tui_goal_terminal_event(event):
+                        record.status = "completed"
+                    inactive_since = time.time()
             elif time.time() - last_visible_event_at > REQUEST_TIMEOUT_S:
                 raise RuntimeError("Hermes TUI event stream timed out")
 
             if inactive_since is not None and time.time() - inactive_since > 1.0:
                 break
 
-        record.status = "completed" if not mgr.is_active() else "inactive"
+        record.status = "completed" if record.status == "completed" or not goal_is_active() else "inactive"
         await finish_response()
     except asyncio.CancelledError:
         if tui_session_id and tui_session_key:
