@@ -7,3 +7,17 @@ out
 .eslintcache
 *.log*
 *.tsbuildinfo
+
+# Hermes/OpenWebUI integration runtime artifacts
+integrations/hermes-openwebui/venv/
+integrations/hermes-openwebui/logs/
+integrations/hermes-openwebui/backend-data-hermes*/
+integrations/hermes-openwebui/data/
+integrations/hermes-openwebui/desktop-data/
+integrations/hermes-openwebui/desktop-roaming/
+integrations/hermes-openwebui/desktop-updater/
+integrations/hermes-openwebui/__pycache__/
+integrations/hermes-openwebui/*.db
+integrations/hermes-openwebui/*.sqlite*
+integrations/hermes-openwebui/.webui_secret_key
+integrations/hermes-openwebui/.local/
