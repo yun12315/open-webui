@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import sys
 import time
 import uuid
@@ -52,6 +53,10 @@ GOAL_STREAM_INTERVAL_S = float(os.getenv("HERMES_OPENWEBUI_GOAL_STREAM_INTERVAL_
 GOAL_VISIBLE_PROGRESS_INTERVAL_S = float(os.getenv("HERMES_OPENWEBUI_GOAL_VISIBLE_PROGRESS_INTERVAL_S", "12"))
 GOAL_TOOL_EVENT_WINDOW_S = float(os.getenv("HERMES_OPENWEBUI_GOAL_TOOL_EVENT_WINDOW_S", "20"))
 GOAL_TOOL_EVENT_MAX_PER_WINDOW = int(os.getenv("HERMES_OPENWEBUI_GOAL_TOOL_EVENT_MAX_PER_WINDOW", "8"))
+HERMES_RUN_MAX_REQUEST_BYTES = int(os.getenv("HERMES_OPENWEBUI_RUN_MAX_REQUEST_BYTES", "9000000"))
+HERMES_RUN_CURRENT_CONTEXT_CHARS = int(os.getenv("HERMES_OPENWEBUI_RUN_CURRENT_CONTEXT_CHARS", "240000"))
+HERMES_RUN_HISTORY_CONTEXT_CHARS = int(os.getenv("HERMES_OPENWEBUI_RUN_HISTORY_CONTEXT_CHARS", "12000"))
+HERMES_RUN_SOURCE_MAX_CHARS = int(os.getenv("HERMES_OPENWEBUI_RUN_SOURCE_MAX_CHARS", "20000"))
 
 ACTIVE_RUN_STATUSES = {"started", "running"}
 SUCCESS_RUN_STATUSES = {"completed", "done"}
@@ -325,6 +330,126 @@ def _join_unique_text(parts: list[str]) -> str:
     return "\n\n".join(unique_parts)
 
 
+def _json_size_bytes(payload: Any) -> int:
+    return len(json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+
+
+def _trim_text_middle(text: str, max_chars: int) -> str:
+    if max_chars <= 0:
+        return ""
+    if len(text) <= max_chars:
+        return text
+    if max_chars < 120:
+        return text[:max_chars]
+    marker = f"\n\n[Bridge note: omitted {len(text) - max_chars} characters to fit Hermes request limits.]\n\n"
+    remaining = max(0, max_chars - len(marker))
+    head = int(remaining * 0.72)
+    tail = remaining - head
+    return text[:head].rstrip() + marker + text[-tail:].lstrip()
+
+
+_CONTEXT_RE = re.compile(r"(<context\b[^>]*>)(.*?)(</context>)", re.IGNORECASE | re.DOTALL)
+_SOURCE_RE = re.compile(r"(<source\b[^>]*>)(.*?)(</source>)", re.IGNORECASE | re.DOTALL)
+
+
+def _compress_context_body(context_body: str, max_context_chars: int, max_source_chars: int) -> str:
+    if len(context_body) <= max_context_chars:
+        return context_body
+
+    source_matches = list(_SOURCE_RE.finditer(context_body))
+    if not source_matches:
+        return _trim_text_middle(context_body, max_context_chars)
+
+    per_source_budget = max(800, min(max_source_chars, max_context_chars // max(1, len(source_matches))))
+    parts: list[str] = []
+    omitted_sources = 0
+    omitted_chars = 0
+    used_chars = 0
+    for match in source_matches:
+        open_tag, source_text, close_tag = match.group(1), match.group(2).strip(), match.group(3)
+        if used_chars >= max_context_chars:
+            omitted_sources += 1
+            omitted_chars += len(source_text)
+            continue
+        remaining = max_context_chars - used_chars
+        budget = min(per_source_budget, remaining)
+        snippet = _trim_text_middle(source_text, budget)
+        omitted_chars += max(0, len(source_text) - len(snippet))
+        parts.append(f"{open_tag}{snippet}{close_tag}")
+        used_chars += len(snippet)
+
+    if omitted_sources or omitted_chars:
+        parts.append(
+            "[Bridge note: OpenWebUI knowledge-base context was compacted before forwarding to "
+            f"Hermes /v1/runs. Omitted {omitted_sources} source(s) and about {omitted_chars} characters; "
+            "source tags and the current question were preserved where possible.]"
+        )
+    return "\n".join(parts)
+
+
+def _compress_rag_context_text(text: str, *, max_context_chars: int, max_source_chars: int) -> str:
+    if "<context" not in text.lower():
+        return text
+
+    def repl(match: re.Match[str]) -> str:
+        open_tag, context_body, close_tag = match.group(1), match.group(2), match.group(3)
+        compacted = _compress_context_body(context_body, max_context_chars, max_source_chars)
+        return f"{open_tag}{compacted}{close_tag}"
+
+    return _CONTEXT_RE.sub(repl, text)
+
+
+def _budget_hermes_run_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    original_size = _json_size_bytes(payload)
+    if isinstance(payload.get("instructions"), str):
+        payload["instructions"] = _compress_rag_context_text(
+            payload["instructions"],
+            max_context_chars=HERMES_RUN_CURRENT_CONTEXT_CHARS,
+            max_source_chars=HERMES_RUN_SOURCE_MAX_CHARS,
+        )
+    if isinstance(payload.get("input"), str):
+        payload["input"] = _compress_rag_context_text(
+            payload["input"],
+            max_context_chars=HERMES_RUN_CURRENT_CONTEXT_CHARS,
+            max_source_chars=HERMES_RUN_SOURCE_MAX_CHARS,
+        )
+
+    history = payload.get("conversation_history")
+    if isinstance(history, list):
+        compact_history: list[dict[str, str]] = []
+        for item in history:
+            if not isinstance(item, dict):
+                continue
+            role = str(item.get("role") or "user")
+            content = _normalize_content(item.get("content", ""))
+            content = _compress_rag_context_text(
+                content,
+                max_context_chars=HERMES_RUN_HISTORY_CONTEXT_CHARS,
+                max_source_chars=min(4000, HERMES_RUN_SOURCE_MAX_CHARS),
+            )
+            compact_history.append({"role": role, "content": content})
+        payload["conversation_history"] = compact_history
+
+    while _json_size_bytes(payload) > HERMES_RUN_MAX_REQUEST_BYTES and isinstance(payload.get("conversation_history"), list) and payload["conversation_history"]:
+        payload["conversation_history"].pop(0)
+
+    shrink_chars = 180000
+    while _json_size_bytes(payload) > HERMES_RUN_MAX_REQUEST_BYTES and shrink_chars >= 20000:
+        for key in ("instructions", "input"):
+            if isinstance(payload.get(key), str) and len(payload[key]) > shrink_chars:
+                payload[key] = _trim_text_middle(payload[key], shrink_chars)
+        shrink_chars //= 2
+
+    final_size = _json_size_bytes(payload)
+    if final_size != original_size:
+        print(
+            f"Hermes OpenWebUI bridge compacted /v1/runs payload from {original_size} to {final_size} bytes",
+            file=sys.stderr,
+            flush=True,
+        )
+    return payload
+
+
 def _looks_like_answer_echo(reasoning_text: str, final_text: str) -> bool:
     reasoning_norm = _compact_text(reasoning_text)
     final_norm = _compact_text(final_text)
@@ -572,6 +697,7 @@ async def _start_hermes_run(prompt: str, session_id: str, *, instructions: Optio
     payload: dict[str, Any] = {"model": "hermes-agent", "input": prompt, "session_id": session_id}
     if instructions:
         payload["instructions"] = instructions
+    payload = _budget_hermes_run_payload(payload)
     data = await _post_json("/v1/runs", payload, session_id=session_id)
     run_id = str(data.get("run_id") or "")
     if not run_id:
@@ -608,6 +734,7 @@ async def _start_hermes_run_for_responses(body: dict[str, Any], session_id: str)
         payload["conversation_history"] = history
     if isinstance(body.get("instructions"), str):
         payload["instructions"] = body["instructions"]
+    payload = _budget_hermes_run_payload(payload)
     data = await _post_json("/v1/runs", payload, session_id=session_id)
     run_id = str(data.get("run_id") or "")
     if not run_id:
