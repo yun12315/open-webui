@@ -1,5 +1,42 @@
-﻿$ErrorActionPreference = 'Stop'
+$ErrorActionPreference = 'Stop'
 
+$OpenWebUIUrl = 'http://127.0.0.1:8080'
+
+
+function Open-OpenWebUI([string]$Url) {
+    Write-Host "Open WebUI is ready: $Url"
+
+    $browserCandidates = @(
+        'C:\Program Files\Google\Chrome\Application\chrome.exe',
+        'C:\Program Files (x86)\Google\Chrome\Application\chrome.exe',
+        'C:\Program Files\Microsoft\Edge\Application\msedge.exe',
+        'C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe'
+    )
+    foreach ($browser in $browserCandidates) {
+        if (Test-Path -LiteralPath $browser) {
+            try {
+                Start-Process -FilePath $browser -ArgumentList @('--new-window', $Url) -ErrorAction Stop | Out-Null
+                return
+            } catch {
+                Write-Host "Browser launch failed: $browser"
+            }
+        }
+    }
+
+    try {
+        Start-Process -FilePath $Url -ErrorAction Stop | Out-Null
+        return
+    } catch {
+        Write-Host "Default browser open failed; trying cmd /c start..."
+    }
+
+    try {
+        Start-Process -FilePath 'cmd.exe' -ArgumentList @('/c', 'start', '""', $Url) -ErrorAction Stop | Out-Null
+        return
+    } catch {
+        Write-Host "Automatic browser launch failed. Please open manually: $Url"
+    }
+}
 function Test-Http([string]$Url, [int]$TimeoutSec = 5) {
     try { return Invoke-WebRequest -Uri $Url -TimeoutSec $TimeoutSec -UseBasicParsing -ErrorAction Stop } catch { return $null }
 }
@@ -45,13 +82,13 @@ try {
     # Prompt command sync failure should not block the UI startup path.
 }
 
-if ($null -eq (Test-Http -Url 'http://127.0.0.1:8080/health' -TimeoutSec 5)) {
+if ($null -eq (Test-Http -Url "$OpenWebUIUrl/health" -TimeoutSec 5)) {
     Get-Process -Name 'open-webui','python' -ErrorAction SilentlyContinue |
         Where-Object { $_.Path -and $_.Path.StartsWith($ScriptDir, [System.StringComparison]::OrdinalIgnoreCase) } |
         Stop-Process -Force -ErrorAction SilentlyContinue
     Start-Sleep -Seconds 2
     Start-Process -FilePath (Join-Path $ScriptDir 'start-openwebui-backend.cmd') -WindowStyle Hidden | Out-Null
-    if (-not (Wait-Http -Url 'http://127.0.0.1:8080/health' -TimeoutSec 240)) { throw 'Open WebUI backend failed to start on 8080' }
+    if (-not (Wait-Http -Url "$OpenWebUIUrl/health" -TimeoutSec 240)) { throw 'Open WebUI backend failed to start on 8080' }
 }
 
-Start-Process 'http://127.0.0.1:8080' | Out-Null
+Open-OpenWebUI -Url $OpenWebUIUrl
