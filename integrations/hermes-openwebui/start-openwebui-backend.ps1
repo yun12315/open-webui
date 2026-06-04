@@ -22,11 +22,13 @@ Set-DefaultEnv 'ENABLE_OPENAI_API' 'True'
 Set-DefaultEnv 'OPENAI_API_BASE_URL' "$BridgeBaseUrl/v1"
 Set-DefaultEnv 'OPENAI_API_KEY' $BridgeKey
 Set-DefaultEnv 'DEFAULT_MODELS' 'hermes-agent'
-Set-DefaultEnv 'RAG_EMBEDDING_ENGINE' 'openai'
-Set-DefaultEnv 'RAG_EMBEDDING_MODEL' 'text-embedding-3-small'
+Set-DefaultEnv 'RAG_EMBEDDING_ENGINE' ''
+Set-DefaultEnv 'RAG_EMBEDDING_MODEL' 'sentence-transformers/all-MiniLM-L6-v2'
 Set-DefaultEnv 'RAG_OPENAI_API_BASE_URL' "$BridgeBaseUrl/v1"
 Set-DefaultEnv 'RAG_OPENAI_API_KEY' $BridgeKey
-Set-DefaultEnv 'BYPASS_EMBEDDING_AND_RETRIEVAL' 'True'
+Set-DefaultEnv 'BYPASS_EMBEDDING_AND_RETRIEVAL' 'False'
+Set-DefaultEnv 'RAG_FULL_CONTEXT' 'False'
+Set-DefaultEnv 'RAG_TOP_K' '5'
 Set-DefaultEnv 'HF_HUB_DISABLE_SYMLINKS_WARNING' '1'
 
 if ([string]::IsNullOrWhiteSpace($env:WEBUI_SECRET_KEY)) {
